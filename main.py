@@ -1,13 +1,10 @@
 import os
-import time
-import math
 import requests
-from datetime import datetime, timezone
 import pandas as pd
+from datetime import datetime, timezone
 
 OKX_BASE = "https://www.okx.com"
 
-# -------------------- Semboller -------------------- #
 TRADE_SYMBOLS = [
     "BTC-USDT", "ETH-USDT",
     "BNB-USDT", "SOL-USDT", "XRP-USDT", "ADA-USDT", "DOGE-USDT"
@@ -16,22 +13,22 @@ TRADE_SYMBOLS = [
 MAJORS = ["BTC-USDT", "ETH-USDT"]
 ALTCOINS = [s for s in TRADE_SYMBOLS if s not in MAJORS]
 
-# -------------------- Telegram -------------------- #
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# -------------------- Helpers -------------------- #
-def ts():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+BUFFER_LONG = 0.995   # -%0.5
+BUFFER_SHORT = 1.005  # +%0.5
 
+# ----------------- Helpers -----------------
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print(text)
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": text})
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": text}
+    )
 
-# -------------------- OKX -------------------- #
 def jget(path, params=None):
     try:
         r = requests.get(OKX_BASE + path, params=params, timeout=10)
@@ -42,87 +39,94 @@ def jget(path, params=None):
         pass
     return []
 
-def get_candles(inst, bar, limit=200):
+# ----------------- Data -----------------
+def get_candles(inst, bar="4H", limit=200):
     raw = jget("/api/v5/market/candles", {"instId": inst, "bar": bar, "limit": limit})
     if not raw:
         return None
     raw = list(reversed(raw))
-    rows = []
-    for r in raw:
-        rows.append({
-            "open": float(r[1]),
-            "high": float(r[2]),
-            "low": float(r[3]),
-            "close": float(r[4]),
-            "volume": float(r[5])
-        })
-    return pd.DataFrame(rows)
+    return pd.DataFrame([{
+        "open": float(r[1]),
+        "high": float(r[2]),
+        "low": float(r[3]),
+        "close": float(r[4]),
+        "volume": float(r[5])
+    } for r in raw])
 
-# -------------------- Indicators -------------------- #
+# ----------------- Indicators -----------------
 def add_indicators(df):
     c = df["close"]
     df["ema_fast"] = c.ewm(span=14).mean()
     df["ema_slow"] = c.ewm(span=28).mean()
-    df["vol_sma"] = df["volume"].rolling(20).mean()
-    df["v_ratio"] = df["volume"] / df["vol_sma"]
     return df
 
-# -------------------- Swings -------------------- #
 def detect_swings(df):
     df["sh"] = False
     df["sl"] = False
     for i in range(2, len(df)-2):
         if df.high[i] > df.high[i-1] and df.high[i] > df.high[i+1]:
-            df.at[i,"sh"] = True
+            df.at[i, "sh"] = True
         if df.low[i] < df.low[i-1] and df.low[i] < df.low[i+1]:
-            df.at[i,"sl"] = True
+            df.at[i, "sl"] = True
     return df
 
-def structure(df):
+# ----------------- Structure -----------------
+def get_structure(df):
     highs = df[df.sh].index.tolist()
-    lows = df[df.sl].index.tolist()
+    lows  = df[df.sl].index.tolist()
 
     ht = lt = None
     if len(highs) >= 2:
         ht = "HH" if df.high[highs[-1]] > df.high[highs[-2]] else "LH"
     if len(lows) >= 2:
         lt = "HL" if df.low[lows[-1]] > df.low[lows[-2]] else "LL"
-
     return ht, lt
 
-# -------------------- Analysis -------------------- #
+# ----------------- SL (SAFE) -----------------
+def calc_safe_sl(df, direction):
+    ema = df.ema_slow.iloc[-1]
+
+    if direction == "UP":
+        lows = df[df.sl].index.tolist()
+        swing = df.low[lows[-1]] if lows else ema
+        return min(swing, ema * BUFFER_LONG)
+
+    else:
+        highs = df[df.sh].index.tolist()
+        swing = df.high[highs[-1]] if highs else ema
+        return max(swing, ema * BUFFER_SHORT)
+
+# ----------------- Analysis -----------------
 def analyze(inst):
-    df = get_candles(inst, "4H")
-    if df is None: return None
+    df = get_candles(inst)
+    if df is None or len(df) < 60:
+        return None
 
     df = add_indicators(df)
     df = detect_swings(df)
 
-    ht, lt = structure(df)
-
+    ht, lt = get_structure(df)
     ema_dir = "UP" if df.ema_fast.iloc[-1] > df.ema_slow.iloc[-1] else "DOWN"
 
-    confirmed = None
-
-    # ✅ LONG: HH veya HL + EMA UP
+    direction = None
     if ema_dir == "UP" and (ht == "HH" or lt == "HL"):
-        confirmed = "UP"
+        direction = "UP"
+    if ema_dir == "DOWN" and lt == "LL":   # LL gelmeden SHORT yok
+        direction = "DOWN"
 
-    # 🔒 SHORT: SADECE LL + EMA DOWN
-    if ema_dir == "DOWN" and lt == "LL":
-        confirmed = "DOWN"
+    if direction is None:
+        return None
 
-    return {
-        "inst": inst,
-        "dir": confirmed,
-        "ht": ht,
-        "lt": lt,
-        "close": df.close.iloc[-1],
-        "hi": df.high.max(),
-        "lo": df.low.min()
-    }
+    close = df.close.iloc[-1]
+    sl = calc_safe_sl(df, direction)
+    risk = abs(close - sl)
 
-# -------------------- MAIN -------------------- #
+    tp1 = close + risk * 1 if direction == "UP" else close - risk * 1
+    tp2 = close + risk * 2 if direction == "UP" else close - risk * 2
+
+    return inst, direction, close, sl, tp1, tp2, ht, lt
+
+# ----------------- MAIN -----------------
 def main():
     results = {}
     for s in TRADE_SYMBOLS:
@@ -130,38 +134,29 @@ def main():
         if r:
             results[s] = r
 
-    # BTC/ETH bearish ise alt LONG kapalı
     block_alt_long = any(
-        results.get(m,{}).get("dir") == "DOWN" for m in MAJORS
+        results.get(m, [None,None])[1] == "DOWN" for m in MAJORS
     )
 
     msgs = []
-
-    for s,d in results.items():
-        if d["dir"] is None:
+    for s,(inst,dir,entry,sl,tp1,tp2,ht,lt) in results.items():
+        if s in ALTCOINS and block_alt_long and dir == "UP":
             continue
 
-        if s in ALTCOINS and block_alt_long and d["dir"] == "UP":
-            continue
-
-        side = "LONG" if d["dir"] == "UP" else "SHORT"
-        arrow = "🟢" if d["dir"] == "UP" else "🔴"
-
-        sl = d["lo"] if d["dir"]=="UP" else d["hi"]
-        tp1 = d["close"] + (d["close"]-sl)*1 if d["dir"]=="UP" else d["close"]-(sl-d["close"])*1
-        tp2 = d["close"] + (d["close"]-sl)*2 if d["dir"]=="UP" else d["close"]-(sl-d["close"])*2
+        arrow = "🟢" if dir=="UP" else "🔴"
+        side  = "LONG" if dir=="UP" else "SHORT"
 
         msgs.append(
             f"{arrow} {s.split('-')[0]} {side}\n"
-            f"Yapı: {d['ht']} / {d['lt']}\n"
-            f"Giriş: {d['close']:.2f}\n"
+            f"Yapı: {ht} / {lt}\n"
+            f"Giriş: {entry:.2f}\n"
             f"SL: {sl:.2f}\n"
             f"TP1: {tp1:.2f}\n"
             f"TP2: {tp2:.2f}\n"
         )
 
     if msgs:
-        send_telegram("⚠️ ONAYLI TREND SİNYALİ\n\n" + "\n".join(msgs))
+        send_telegram("⚠️ ONAYLI TREND SİNYALİ (GÜVENLİ SL)\n\n" + "\n".join(msgs))
     else:
         print("Sinyal yok.")
 
