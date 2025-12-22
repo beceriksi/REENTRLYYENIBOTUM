@@ -114,7 +114,6 @@ def get_candles(inst, bar, limit=200):
 def get_trade_flow(inst):
     """
     OKX spot trade verisinden net USD akışını hesaplar.
-    Yeni OKX API formatıyla %100 uyumlu.
     """
     data = jget_okx("/api/v5/market/trades",
                     {"instId": inst, "limit": 200})
@@ -146,7 +145,6 @@ def get_trade_flow(inst):
         except:
             continue
 
-    # whale kategorisi
     if max_size >= 1_000_000:
         cat = "XXL"
     elif max_size >= 500_000:
@@ -163,6 +161,8 @@ def get_trade_flow(inst):
         "cat": cat,
         "dir": "UP" if max_side == "buy" else "DOWN" if max_side == "sell" else None
     }
+
+
 # ---------------------- İndikatörler ---------------------- #
 
 def add_indicators(df):
@@ -237,7 +237,7 @@ def get_structure(df, idx):
     }
 
 
-# ---------------------- Trend Onay (C modeli) ---------------------- #
+# ---------------------- Trend Onay ---------------------- #
 
 def trend_decision(df, idx, whale_dir):
     st = get_structure(df, idx)
@@ -249,13 +249,11 @@ def trend_decision(df, idx, whale_dir):
     confirmed = None
 
     if struct_dir != "NEUTRAL" and struct_dir == ema_dir:
-        match = 2  # structure + EMA
-
+        match = 2
         if macd_dir == struct_dir:
             match += 1
         if whale_dir == struct_dir:
             match += 1
-
         if match >= 3:
             confirmed = struct_dir
 
@@ -298,7 +296,6 @@ def analyze(inst):
     now = trend_decision(df4, i4, whale_dir)
     prev = trend_decision(df4, p4, None)
 
-    # 1D trend
     s1 = get_structure(df1, len(df1)-1)
     ema1 = "UP" if df1["ema_fast"].iloc[-1] > df1["ema_slow"].iloc[-1] else "DOWN"
 
@@ -309,25 +306,13 @@ def analyze(inst):
     else:
         day = "NEUTRAL"
 
-    close = df4["close"].iloc[-1]
-    hi_idx = now["structure"]["hi_idx"]
-    lo_idx = now["structure"]["lo_idx"]
-
-    if hi_idx is not None and lo_idx is not None:
-        swing_range = abs(df4.at[hi_idx, "high"] - df4.at[lo_idx, "low"])
-    else:
-        swing_range = df4["high"].tail(20).max() - df4["low"].tail(20).min()
-
     return {
         "inst": inst,
         "df4": df4,
         "day": day,
         "now": now,
         "prev": prev,
-        "close": close,
-        "swing": swing_range,
-        "hi": hi_idx,
-        "lo": lo_idx,
+        "close": df4["close"].iloc[-1],
         "net": net,
         "whale_cat": whale_cat,
         "whale_dir": whale_dir,
@@ -335,19 +320,41 @@ def analyze(inst):
         "high_type": now["structure"]["high"],
         "low_type": now["structure"]["low"]
     }
-def side_text(d):
-    return "LONG" if d == "UP" else "SHORT"
 
-def side_arrow(d):
-    return "🟢" if d == "UP" else "🔴"
 
-def strength(now, day):
-    if day == "NEUTRAL":
-        return "Nötr Sinyal"
-    return "Güçlü Sinyal" if now == day else "Zayıf Sinyal (Karşı Trend)"
+# ---------------------- GÜNLÜK ÖZET (EK) ---------------------- #
 
-def px(x):
-    return f"{x:,.2f}"
+def send_daily_summary(A, title):
+    lines = [f"📊 {title}\n"]
+
+    for s, d in A.items():
+        now = d["now"]["confirmed"]
+        raw = d["now"]["raw"]
+        day = d["day"]
+
+        if now == "UP":
+            status = "🟢 LONG"
+        elif now == "DOWN":
+            status = "🔴 SHORT"
+        else:
+            status = "⏸ BEKLE (Onay Yok)"
+
+        whale = f"{d['whale_cat']} / {d['net']:,.0f} USDT"
+        if d["whale_dir"] == "UP":
+            whale += " (Alım)"
+        elif d["whale_dir"] == "DOWN":
+            whale += " (Satış)"
+
+        lines.append(
+            f"{s.split('-')[0]} — {status}\n"
+            f"• 4H EMA: {raw}\n"
+            f"• Yapı: {d['high_type']} | {d['low_type']}\n"
+            f"• Whale: {whale}\n"
+            f"• vRatio: {d['v_ratio']:.2f}\n"
+            f"• 1D: {day}\n"
+        )
+
+    send_telegram("\n".join(lines))
 
 
 # ---------------------- MAIN ---------------------- #
@@ -366,92 +373,25 @@ def main():
         print("[HATA] Analiz yok.")
         return
 
-    # ---------------- Trend değişimi kontrol ---------------- #
-    trend_msg = []
-    detail = []
-    changed = False
-
-    for s in SYMBOLS:
-        d = A[s]
+    # Trend değişimi
+    for s, d in A.items():
         now = d["now"]["confirmed"]
         prev = d["prev"]["confirmed"]
-        day = d["day"]
 
-        if now is None:
-            continue
+        if now is not None and (prev is None or prev != now):
+            send_telegram(f"⚠️ TREND DEĞİŞİMİ — {s} → {now}")
+            return
 
-        if prev is None or prev != now:
-            changed = True
-            swing = d["swing"]
-            close = d["close"]
+    # ---- GÜNLÜK ÖZET ----
+    hour = datetime.now(timezone.utc).hour
 
-            if now == "UP":
-                sl = d["df4"]["low"].iloc[d["lo"]] if d["lo"] else close * 0.97
-                tp1 = close + swing * 0.5
-                tp2 = close + swing * 1.0
-                tp3 = close + swing * 1.5
-            else:
-                sl = d["df4"]["high"].iloc[d["hi"]] if d["hi"] else close * 1.03
-                tp1 = close - swing * 0.5
-                tp2 = close - swing * 1.0
-                tp3 = close - swing * 1.5
+    if hour == 9:
+        send_daily_summary(A, "SABAH TREND ÖZETİ (4H)")
 
-            trend_msg.append(
-                f"{side_arrow(now)} {s.split('-')[0]} {side_text(now)} AÇ ({strength(now, day)})"
-            )
+    if hour == 18:
+        send_daily_summary(A, "AKŞAM TREND ÖZETİ (4H)")
 
-            # detay ekle
-            h = d["high_type"]
-            l = d["low_type"]
-
-            hh = []
-            if h: hh.append(("🟢" if h=="HH" else "🔴") + " " + h)
-            if l: hh.append(("🟢" if l=="HL" else "🔴") + " " + l)
-            ms = " | ".join(hh) if hh else "-"
-
-            whale_line = f"{d['whale_cat']} / {d['net']:,.0f} USDT"
-            if d["whale_dir"] == "UP":
-                whale_line += " (Alım)"
-            elif d["whale_dir"] == "DOWN":
-                whale_line += " (Satış)"
-
-            detail.append(
-                f"\n{s.split('-')[0]}:\n"
-                f"- Yapı: {ms}\n"
-                f"- Whale: {whale_line}\n"
-                f"- vRatio: {d['v_ratio']:.2f}\n"
-                f"- 1D: {day}\n"
-                f"- SL: {px(sl)}\n"
-                f"- TP1: {px(tp1)}\n"
-                f"- TP2: {px(tp2)}\n"
-                f"- TP3: {px(tp3)}\n"
-            )
-
-    if changed:
-        text = "⚠️ TREND DEĞİŞİMİ — 4H KAPANIŞ\n\n" + \
-               "\n".join(trend_msg) + "\n" + "".join(detail)
-        send_telegram(text)
-        print("[INFO] Trend mesajı gönderildi.")
-        return
-
-    # ---------------- UYARI ---------------- #
-
-    warn = []
-    for s in SYMBOLS:
-        d = A[s]
-        important = d["high_type"] in ("HH", "LL") or d["low_type"] in ("HL", "LL")
-        big_v = d["v_ratio"] >= 3
-        big_w = d["whale_cat"] in ("L", "XL", "XXL")
-
-        if important and (big_v or big_w):
-            warn.append(f"{s}: Yapı={d['high_type']}/{d['low_type']} vRatio={d['v_ratio']:.1f} Whale={d['whale_cat']}")
-
-    if warn:
-        send_telegram("❗ Önemli 4H Uyarı:\n" + "\n".join(warn))
-        print("[INFO] Uyarı gönderildi.")
-        return
-
-    print("[INFO] Değişim yok, uyarı yok.")
+    print("[INFO] Değişim yok.")
 
 
 if __name__ == "__main__":
